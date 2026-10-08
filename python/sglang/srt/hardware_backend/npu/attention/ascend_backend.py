@@ -792,7 +792,8 @@ class AscendAttnBackend(AttentionBackend):
         return torch.cat([topk_indices, padding], dim=0)
 
     def get_cuda_graph_seq_len_fill_value(self):
-        return 0
+        # PagedAttention needs a nonempty dummy sequence during graph capture.
+        return 1 if not self.use_mla and not self.use_fia else 0
 
     def _generate_alibi_bias(
         self,
@@ -2362,6 +2363,40 @@ class AscendAttnBackend(AttentionBackend):
                 return attn_out
 
         if not self.use_mla:
+            if (
+                not self.use_fia
+                and not self.use_fa
+                and not self.use_alibi
+                and forward_batch.encoder_lens is None
+                and layer.logit_cap == 0
+            ):
+                query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                output = torch.empty(
+                    (query.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                    dtype=q.dtype,
+                    device=q.device,
+                )
+                context_lens = torch.tensor(
+                    self.forward_metadata.seq_lens_cpu_list,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+                params = dict(
+                    query=query,
+                    key_cache=self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                    value_cache=self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                    num_heads=layer.tp_q_head_num,
+                    num_kv_heads=layer.tp_k_head_num,
+                    scale_value=layer.scaling,
+                    block_table=self.forward_metadata.block_tables,
+                    context_lens=context_lens,
+                    out=output,
+                )
+                workspace = torch_npu._npu_paged_attention_get_workspace(**params)
+                torch_npu._npu_paged_attention(**params, workspace=workspace)
+                return output.view(
+                    query.shape[0], layer.tp_q_head_num * layer.v_head_dim
+                )
             seq_lens_cpu_int = self.forward_metadata.seq_lens_cpu_int
             seq_lens_cpu_list = self.forward_metadata.seq_lens_cpu_list
             if self._is_swa_layer(layer):

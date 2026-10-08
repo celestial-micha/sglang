@@ -172,11 +172,133 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                 seq_lens = torch.from_numpy(np.array(seq_lens).astype(np.int32))
             cpu_update_input = [{attr_name: seq_lens}]
 
+        cpu_update_input = [
+            (
+                {
+                    **update,
+                    "context_lens": torch.tensor(
+                        update["actual_seq_lengths_kv"], dtype=torch.int32, device="cpu"
+                    ),
+                }
+                if "actual_seq_lengths_kv" in update
+                else update
+            )
+            for update in cpu_update_input
+        ]
         graph = self._graphs[shape_key]
+
+        def _tensor_geometry(value, torch_npu):
+            # PA scratch sizing depends on logical geometry, not a layer slice's
+            # position inside the joint KV backing storage.
+            return (
+                str(value.device),
+                str(value.dtype),
+                str(value.layout),
+                tuple(value.shape),
+                tuple(value.stride()),
+                (
+                    torch_npu.get_npu_format(value)
+                    if value.device.type == "npu"
+                    else None
+                ),
+            )
+
+        def _workspace_signature(args, kwargs, schema_names, torch_npu):
+            parameter_names = (
+                "query",
+                "key_cache",
+                "value_cache",
+                "num_kv_heads",
+                "num_heads",
+                "scale_value",
+                "block_table",
+                "context_lens",
+                "out",
+            )
+            assert set(schema_names) == {
+                *parameter_names,
+                "workspace",
+            }, f"Unexpected PagedAttention schema: {schema_names}"
+
+            def get_argument(name):
+                index = schema_names.index(name)
+                if index < len(args):
+                    return args[index]
+                return kwargs[name]
+
+            query, key_cache, value_cache = (
+                get_argument(name) for name in parameter_names[:3]
+            )
+            block_table = get_argument("block_table")
+            context_lens = get_argument("context_lens")
+            output = get_argument("out")
+            return (
+                _tensor_geometry(query, torch_npu),
+                _tensor_geometry(key_cache, torch_npu),
+                _tensor_geometry(value_cache, torch_npu),
+                get_argument("num_kv_heads"),
+                get_argument("num_heads"),
+                get_argument("scale_value"),
+                _tensor_geometry(block_table, torch_npu)
+                + (block_table.storage_offset(), block_table.data_ptr()),
+                _tensor_geometry(context_lens, torch_npu)
+                + (context_lens.storage_offset(), tuple(context_lens.tolist())),
+                _tensor_geometry(output, torch_npu),
+            )
+
+        def _prepare_update_inputs():
+            import torch_npu
+
+            records = graph.graph_dispatch_mode.graph_dispatch_records
+            if len(cpu_update_input) == 1:
+                update_inputs = [cpu_update_input[0].copy() for _ in records]
+            else:
+                update_inputs = [update.copy() for update in cpu_update_input]
+
+            if len(update_inputs) != len(records):
+                return update_inputs
+
+            workspace_cache = {}
+            for record, update_input in zip(records, update_inputs):
+                if record.op_cache_entry.__name__ != "_npu_paged_attention.default":
+                    continue
+                assert (
+                    "context_lens" in update_input
+                ), "PagedAttention graph records require a context_lens update"
+                assert (
+                    "workspace" in record.kwargs
+                ), "PagedAttention graph records must capture workspace as a keyword"
+
+                args = list(record.args)
+                kwargs = dict(record.kwargs)
+                schema_names = [
+                    argument.name
+                    for argument in record.op_cache_entry._schema.arguments
+                ]
+                context_lens_index = schema_names.index("context_lens")
+                if context_lens_index < len(args):
+                    args[context_lens_index] = update_input["context_lens"]
+                else:
+                    kwargs["context_lens"] = update_input["context_lens"]
+                kwargs.pop("workspace")
+                signature = _workspace_signature(args, kwargs, schema_names, torch_npu)
+                if signature not in workspace_cache:
+                    workspace_cache[signature] = (
+                        torch_npu._npu_paged_attention_get_workspace(*args, **kwargs)
+                    )
+                update_input["workspace"] = workspace_cache[signature]
+            return update_inputs
+
+        self._device_module.set_device(self._device_id)
+        with self._device_module.stream(graph.graph_dispatch_mode.update_stream):
+            # PagedAttention workspace size is not monotonic in context length.
+            # Prepare it before replay so schema, allocation, or OOM failures are
+            # raised on this calling thread instead of stranding graph.replay().
+            update_inputs = _prepare_update_inputs()
 
         def _update():
             self._device_module.set_device(self._device_id)
-            graph.update(cpu_update_input=cpu_update_input)
+            graph.update(cpu_update_input=update_inputs)
 
         thread = threading.Thread(target=_update)
         thread.start()

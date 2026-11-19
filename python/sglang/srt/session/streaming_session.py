@@ -10,6 +10,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
     TreeLock,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.utils.common import ceil_align, is_npu
 
 if TYPE_CHECKING:
@@ -42,6 +44,9 @@ class SessionSlot:
     # Until the first turn finishes or is retracted, its checkpoints publish
     # the prompt into the tree and move the lock onto the deepest published node.
     publishes_prompt: bool = False
+    # Number of consumed positions certified by a completed one-token turn.
+    # A rewind invalidates this until a fresh slot computes the prompt again.
+    single_token_commit_len: Optional[int] = None
 
 
 def is_virtual_node(node: Any) -> bool:
@@ -102,9 +107,12 @@ class StreamingSession:
             return None
 
         req = params.req
+        align_npu = is_npu() and self.cache.page_size > 1
+        if align_npu and self._can_append_one_npu_token(params, slot):
+            align_npu = False
 
-        # [NPU] Below one aligned page, drop the slot's KV and fully prefill.
-        if is_npu() and self.cache.page_size > 1:
+        # When aligning on NPU, a prefix shorter than one page is re-prefilled.
+        if align_npu:
             expected_prefix_len = min(slot.kv.kv_committed_len, len(params.key))
             aligned_prefix_len = (
                 expected_prefix_len // self.cache.page_size
@@ -134,15 +142,17 @@ class StreamingSession:
             f"{slot.kv.cache_protected_len=}"
         )
 
-        # NPU requires page-aligned KV reuse; a rewind below the SWA eviction
-        # cursor must also land on a page boundary -- free_kv_row_segments
-        # splits dead/alive at the cursor, and a mid-page cut frees a page twice.
+        # Align NPU reuse outside the private-page append path. A rewind below
+        # the SWA eviction cursor must also land on a page boundary because
+        # free_kv_row_segments splits dead/alive there and frees whole pages.
         if self.cache.page_size > 1 and (
-            is_npu() or req.kv.max_evicted_seqlen > prefix_len
+            align_npu or req.kv.max_evicted_seqlen > prefix_len
         ):
             prefix_len = (prefix_len // self.cache.page_size) * self.cache.page_size
             req.kv.kv_committed_len = min(req.kv.kv_committed_len, prefix_len)
 
+        if slot.single_token_commit_len != prefix_len:
+            slot.single_token_commit_len = None
         self._free_tail(req.kv, prefix_len)
 
         return MatchResult(
@@ -151,6 +161,55 @@ class StreamingSession:
             last_host_node=slot.virtual_node,
             best_match_node=slot.virtual_node,
             cache_protected_len=slot.kv.cache_protected_len,
+        )
+
+    def _can_append_one_npu_token(
+        self, params: MatchPrefixParams, slot: SessionSlot
+    ) -> bool:
+        # The last successful turn must have committed exactly this private
+        # prefix, including the recurrent state when the cache owns one.
+        req = params.req
+        kv = slot.kv
+        prefix_len = len(params.key)
+        if not (
+            slot.single_token_commit_len == prefix_len > 0
+            and self.cache.disable
+            and prefix_len == kv.kv_committed_len == kv.kv_allocated_len
+            and prefix_len + 1 == len(req.full_untruncated_fill_ids)
+            and req.sampling_params.max_new_tokens == 1
+            and req.retraction_count == 0
+            and kv.cache_protected_len == kv.max_evicted_seqlen == 0
+            and kv.holds_mamba == self.cache.is_mamba_enabled
+            and (kv.holds_mamba or self.cache.tree_components == (ComponentType.FULL,))
+            and kv.mamba_ping_pong_track_buffer is None
+            and not kv.mamba_needs_clear
+            and kv.mamba_cow_src_index is None
+            and kv.retraction_backup is None
+            and not self.cache.enable_mamba_extra_buffer
+            and self.cache.req_to_token_pool._aux_cache is None
+        ):
+            return False
+
+        from sglang.srt.hardware_backend.npu.allocator_npu import (
+            NPUPagedTokenToKVPoolAllocator,
+        )
+
+        allocator = self.cache.token_to_kv_pool_allocator
+        if type(allocator) is not NPUPagedTokenToKVPoolAllocator:
+            return False
+        if not kv.holds_mamba:
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                NPUMHATokenToKVPool,
+            )
+
+            if type(allocator.get_kvcache()) is not NPUMHATokenToKVPool:
+                return False
+
+        return (
+            get_parallel().attn_dcp_size == 1
+            and get_disagg().disaggregation_mode == "null"
+            and get_schedule().disable_overlap_schedule
+            and get_spec().speculative_algorithm is None
         )
 
     def try_cache_finished_req(self, req: Req) -> bool:
@@ -176,7 +235,26 @@ class StreamingSession:
         finished_len = (
             req.finished_len if req.finished_len is not None else len(req.output_ids)
         )
-        target = len(req.origin_input_ids) + finished_len
+        consumed_len = len(req.origin_input_ids)
+        if is_npu() and self.cache.page_size > 1 and self.cache.disable:
+            kv = slot.kv
+            # A one-token turn samples its output from the last prompt row.
+            # The sampled token is consumed by the next turn, so it has no KV yet.
+            if (
+                (slot.publishes_prompt or slot.single_token_commit_len is not None)
+                and req.finished()
+                and req.sampling_params.max_new_tokens == 1
+                and finished_len == len(req.output_ids) == 1
+                and req.retraction_count == 0
+                and kv.holds_mamba == self.cache.is_mamba_enabled
+                and kv.cache_protected_len == kv.max_evicted_seqlen == 0
+                and consumed_len == kv.kv_allocated_len == kv.kv_committed_len
+            ):
+                slot.single_token_commit_len = consumed_len
+            else:
+                slot.single_token_commit_len = None
+
+        target = consumed_len + finished_len
         self._trim_overshoot(req, finished_len)
 
         req.detach_kv()

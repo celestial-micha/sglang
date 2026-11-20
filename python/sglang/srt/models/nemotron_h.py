@@ -94,6 +94,7 @@ from sglang.srt.utils import (
     add_prefix,
     get_current_device_stream_fast,
     is_cuda,
+    is_npu,
     is_sm120,
     make_pp_layers,
 )
@@ -101,6 +102,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
+_is_npu = is_npu()
 
 if _is_cuda:
     from sglang.kernels.ops.gemm.fused_a_gemm import (
@@ -662,7 +664,7 @@ class NemotronHMambaDecoderLayer(NemotronHAttnLikeDecoderLayer):
             hidden_states=hidden_states,
             output=None,
             forward_batch=forward_batch,
-            use_triton_causal_conv=True,
+            use_triton_causal_conv=not _is_npu,
         )
 
     def _forward_mixer(

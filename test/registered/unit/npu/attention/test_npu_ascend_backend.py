@@ -732,5 +732,144 @@ class TestMlaPrefixFia(unittest.TestCase):
                     )
 
 
+class TestUnalignedCachedPrefix(unittest.TestCase):
+    """Partial private pages must not reach the page-aligned qlens kernel."""
+
+    def _run_prefix_batch(self, prefixes, queries, *, alibi=False, expect_qlens=False):
+        from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
+            AscendTorchNativeAttnBackend,
+        )
+
+        torch.manual_seed(419)
+        heads, kv_heads, dim, page_size = 4, 2, 16, 128
+        lengths = [p + q for p, q in zip(prefixes, queries)]
+        slots = torch.stack(
+            [
+                torch.arange(n) + (i + 1) * 512
+                for i, n in enumerate([512] * len(prefixes))
+            ]
+        )
+        key = torch.randn((len(prefixes) + 1) * 512, kv_heads, dim)
+        value = torch.randn_like(key)
+        query = torch.randn(sum(queries), heads, dim)
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.use_mla = backend.use_fia = backend.use_fa = False
+        backend.use_alibi = alibi
+        backend.is_dllm_model = backend.is_hybrid_swa = False
+        backend.page_size = page_size
+        backend.native_attn = AscendTorchNativeAttnBackend()
+        backend.mask = torch.ones(128, 128).triu(1)
+        backend.forward_metadata = ForwardMetadata(
+            block_tables=slots[:, ::page_size] // page_size,
+            seq_lens_cpu_int=torch.tensor(lengths, dtype=torch.int32),
+            extend_seq_lens_cpu_int=torch.tensor(queries, dtype=torch.int32),
+        )
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=slots)
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: key,
+            get_value_buffer=lambda _: value,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=heads,
+            tp_k_head_num=kv_heads,
+            tp_v_head_num=kv_heads,
+            qk_head_dim=dim,
+            v_head_dim=dim,
+            scaling=dim**-0.5,
+            is_cross_attention=False,
+            attn_type=None,
+            logit_cap=0,
+            logit_capping_method="tanh",
+            sliding_window_size=-1,
+        )
+        batch = SimpleNamespace(
+            encoder_lens=None,
+            req_pool_indices=torch.arange(len(prefixes)),
+            seq_lens=torch.tensor(lengths),
+            extend_prefix_lens=torch.tensor(prefixes),
+            extend_seq_lens=torch.tensor(queries),
+            extend_prefix_lens_cpu=prefixes,
+            extend_seq_lens_cpu=queries,
+            forward_mode=SimpleNamespace(
+                is_context_parallel_extend=lambda: False,
+                is_target_verify=lambda: False,
+                is_draft_extend_v2=lambda: False,
+            ),
+        )
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        slopes = torch.tensor([0.1, 0.2, 0.3, 0.4]) if alibi else None
+        sentinel = torch.full((sum(queries), heads * dim), 17.0)
+        if alibi:
+            backend.attn_alibi = MagicMock(return_value=sentinel)
+
+        def qlens(**kwargs):
+            if not expect_qlens:
+                raise AssertionError("unaligned history reached the qlens kernel")
+            kwargs["out"].copy_(sentinel)
+
+        with (
+            patch(f"{module}.is_mla_preprocess_enabled", return_value=False),
+            patch(
+                f"{module}.torch_npu._npu_flash_attention_qlens",
+                side_effect=qlens,
+            ) as kernel,
+        ):
+            actual = backend.forward_extend(
+                query, None, None, layer, batch, save_kv_cache=False, slopes=slopes
+            )
+        if alibi:
+            backend.attn_alibi.assert_called_once()
+            self.assertIs(backend.attn_alibi.call_args.kwargs["slopes"], slopes)
+            kernel.assert_not_called()
+            torch.testing.assert_close(actual, sentinel)
+            return
+        if expect_qlens:
+            kernel.assert_called_once()
+            torch.testing.assert_close(actual, sentinel)
+            return
+        expected = []
+        offset = 0
+        for index, (prefix, count, length) in enumerate(
+            zip(prefixes, queries, lengths)
+        ):
+            q = query[offset : offset + count].double().transpose(0, 1)
+            k = (
+                key[slots[index, :length]]
+                .double()
+                .repeat_interleave(heads // kv_heads, dim=1)
+                .transpose(0, 1)
+            )
+            v = (
+                value[slots[index, :length]]
+                .double()
+                .repeat_interleave(heads // kv_heads, dim=1)
+                .transpose(0, 1)
+            )
+            scores = q @ k.transpose(-1, -2) * layer.scaling
+            visible = (
+                torch.arange(length)[None, :] <= prefix + torch.arange(count)[:, None]
+            )
+            scores.masked_fill_(~visible, -float("inf"))
+            expected.append((scores.softmax(-1) @ v).transpose(0, 1))
+            offset += count
+        expected = torch.cat(expected).reshape(sum(queries), -1).float()
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+    def test_single_token_partial_pages(self):
+        for prefix in (1, 127, 129, 255, 257):
+            with self.subTest(prefix=prefix):
+                self._run_prefix_batch([prefix], [1])
+
+    def test_multiple_tokens_and_mixed_prefixes(self):
+        self._run_prefix_batch([127, 128, 129, 0], [2, 1, 3, 2])
+
+    def test_alibi_keeps_its_bias_path_for_partial_pages(self):
+        self._run_prefix_batch([129], [1], alibi=True)
+
+    def test_aligned_prefixes_keep_qlens(self):
+        self._run_prefix_batch([0, 128, 256], [3, 1, 2], expect_qlens=True)
+
+
 if __name__ == "__main__":
     unittest.main()

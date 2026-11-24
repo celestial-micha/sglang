@@ -2022,6 +2022,16 @@ class AscendAttnBackend(AttentionBackend):
                     and forward_batch.encoder_lens is None
                     and layer.logit_cap == 0
                     and not getattr(self, "use_native_sdpa", False)
+                    # Keep partial-page prefixes on the native path: qlens
+                    # can return without writing its output for these inputs.
+                    # ALiBi uses a separate implementation below.
+                    and (
+                        self.use_alibi
+                        or all(
+                            prefix_len % self.page_size == 0
+                            for prefix_len in forward_batch.extend_prefix_lens_cpu
+                        )
+                    )
                 ):
                     if not self.use_alibi:
                         query = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
